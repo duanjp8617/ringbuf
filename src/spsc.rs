@@ -1,5 +1,3 @@
-#![feature(alloc)]
-
 use std::{
     intrinsics::drop_in_place,
     sync::atomic::{AtomicUsize, Ordering},
@@ -11,6 +9,7 @@ use std::sync::Arc;
 struct SyncRingBuf<T> {
     buf: *mut T,
     cap: usize,
+    mask: usize,
     read_idx: CacheLine,
     write_idx: CacheLine,
 }
@@ -28,12 +27,14 @@ impl CacheLine {
 }
 
 unsafe impl<T: Sync> Sync for SyncRingBuf<T> {}
-unsafe impl<T: Send> Send for SyncRingBuf<T> {}
+// unsafe impl<T: Send> Send for SyncRingBuf<T> {}
 
 impl<T> SyncRingBuf<T> {
     fn with_capacity(mut cap: usize) -> Self {
-        assert!(cap > 0 && cap < usize::MAX, "invalid capacity size");
-        cap += 1;
+        assert!(0 < cap && cap < usize::MAX, "invalid capacity size");
+        cap = (cap + 1)
+            .checked_next_power_of_two()
+            .expect("invalid capacity size");
 
         let mut v = Vec::with_capacity(cap);
         let buf = v.as_mut_ptr();
@@ -42,6 +43,7 @@ impl<T> SyncRingBuf<T> {
         Self {
             buf,
             cap,
+            mask: cap - 1,
             read_idx: CacheLine::new(0),
             write_idx: CacheLine::new(0),
         }
@@ -49,11 +51,7 @@ impl<T> SyncRingBuf<T> {
 
     fn try_push(&self, t: T) -> Option<T> {
         let curr_write_idx = self.write_idx.inner.load(Ordering::Relaxed);
-
-        let mut next_write_idx = curr_write_idx + 1;
-        if next_write_idx >= self.cap {
-            next_write_idx = 0;
-        }
+        let next_write_idx = curr_write_idx + 1 & self.mask;
 
         if next_write_idx == self.read_idx.inner.load(Ordering::Acquire) {
             Some(t)
@@ -76,12 +74,9 @@ impl<T> SyncRingBuf<T> {
         } else {
             let t = unsafe { std::ptr::read(self.buf.add(curr_read_idx) as *const T) };
 
-            let mut next_read_idx = curr_read_idx + 1;
-            if next_read_idx >= self.cap {
-                next_read_idx = 0
-            }
-
+            let next_read_idx = curr_read_idx + 1 & self.mask;
             self.read_idx.inner.store(next_read_idx, Ordering::Release);
+
             Some(t)
         }
     }
@@ -89,8 +84,8 @@ impl<T> SyncRingBuf<T> {
 
 impl<T> Drop for SyncRingBuf<T> {
     fn drop(&mut self) {
-        let curr_read_idx = self.read_idx.inner.load(Ordering::Relaxed);
-        let curr_write_idx = self.write_idx.inner.load(Ordering::Relaxed);
+        let curr_read_idx = self.read_idx.inner.load(Ordering::Acquire);
+        let curr_write_idx = self.write_idx.inner.load(Ordering::Acquire);
 
         if curr_read_idx <= curr_write_idx {
             for i in curr_read_idx..curr_write_idx {
@@ -117,16 +112,47 @@ impl<T> Drop for SyncRingBuf<T> {
     }
 }
 
+pub struct Producer<T> {
+    inner: Arc<SyncRingBuf<T>>,
+}
+
+unsafe impl<T: Send> Send for Producer<T> {}
+
+impl<T> Producer<T> {
+    pub fn try_push(&mut self, t: T) -> Option<T> {
+        self.inner.try_push(t)
+    }
+}
+
+pub struct Consumer<T> {
+    inner: Arc<SyncRingBuf<T>>,
+}
+
+unsafe impl<T: Send> Send for Consumer<T> {}
+
+impl<T> Consumer<T> {
+    pub fn try_pop(&mut self) -> Option<T> {
+        self.inner.try_pop()
+    }
+}
+
+pub fn with_capacity<T>(cap: usize) -> (Producer<T>, Consumer<T>) {
+    let rb = Arc::new(SyncRingBuf::with_capacity(cap));
+    let p = Producer { inner: rb.clone() };
+    let c = Consumer { inner: rb };
+    (p, c)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, mem::size_of, rc::Rc};
     use lazy_static::lazy_static;
+    use std::{cell::RefCell, mem::size_of, rc::Rc};
 
     use super::*;
 
     lazy_static! {
         static ref RB: SyncRingBuf<i32> = {
-            let rb = SyncRingBuf::with_capacity(100);
+            let rb = SyncRingBuf::with_capacity(500);
             rb
         };
     }
@@ -139,6 +165,7 @@ mod tests {
         let empty_val = SyncRingBuf {
             buf: &mut v as *mut i32,
             cap: 0,
+            mask: 0,
             read_idx: CacheLine {
                 inner: AtomicUsize::new(0),
             },
@@ -152,41 +179,43 @@ mod tests {
         let write_index_addr = &empty_val.write_idx as *const CacheLine as usize;
         let buf_addr = &empty_val.buf as *const *mut i32 as usize;
         let cap_addr = &empty_val.cap as *const usize as usize;
+        let mask_addr = &empty_val.mask as *const usize as usize;
 
         assert_eq!(buf_addr - empty_val_addr, 0);
         assert_eq!(cap_addr - empty_val_addr, 8);
+        assert_eq!(mask_addr - empty_val_addr, 16);
         assert_eq!(read_index_addr - empty_val_addr, 64);
         assert_eq!(write_index_addr - empty_val_addr, 128);
     }
 
     #[test]
-    fn push_pop() {
-        let rb = SyncRingBuf::<i32>::with_capacity(5);
-        assert_eq!(rb.try_pop(), None);
+    fn single_thread_push_pop() {
+        let (mut sender, mut receiver) = with_capacity(4);
+        assert_eq!(receiver.try_pop(), None);
 
-        assert_eq!(rb.try_push(0), None);
-        assert_eq!(rb.try_pop(), Some(0));
+        assert_eq!(sender.try_push(0), None);
+        assert_eq!(receiver.try_pop(), Some(0));
 
-        assert_eq!(rb.try_push(1), None);
-        assert_eq!(rb.try_pop(), Some(1));
+        assert_eq!(sender.try_push(1), None);
+        assert_eq!(receiver.try_pop(), Some(1));
 
-        assert_eq!(rb.try_push(2), None);
-        assert_eq!(rb.try_pop(), Some(2));
+        assert_eq!(sender.try_push(2), None);
+        assert_eq!(receiver.try_pop(), Some(2));
 
-        for i in 0..5 {
-            assert_eq!(rb.try_push(i), None);
+        for i in 0..7 {
+            assert_eq!(sender.try_push(i), None);
         }
-        assert_eq!(rb.try_push(5), Some(5));
-        assert_eq!(rb.try_push(6), Some(6));
+        assert_eq!(sender.try_push(7), Some(7));
+        assert_eq!(sender.try_push(8), Some(8));
 
-        for i in 0..5 {
-            assert_eq!(rb.try_pop(), Some(i));
+        for i in 0..7 {
+            assert_eq!(receiver.try_pop(), Some(i));
         }
-        assert_eq!(rb.try_pop(), None);
+        assert_eq!(receiver.try_pop(), None);
     }
 
     #[test]
-    fn drop_test() {
+    fn single_thread_drop() {
         struct Tester {
             common: Rc<RefCell<i32>>,
         }
@@ -205,61 +234,67 @@ mod tests {
         }
 
         let common = Rc::new(RefCell::new(0));
-        let rb = SyncRingBuf::with_capacity(50);
-        for _ in 0..40 {
-            rb.try_push(Tester::new(common.clone()));
+        let (mut sender, mut receiver) = with_capacity(50);
+        for _ in 0..50 {
+            sender.try_push(Tester::new(common.clone()));
         }
         for _ in 0..10 {
-            rb.try_pop();
-        }
-        assert_eq!(*common.borrow(), 30);
-        drop(rb);
-        assert_eq!(*common.borrow(), 0);
-
-        let rb = SyncRingBuf::with_capacity(50);
-        for _ in 0..40 {
-            rb.try_push(Tester::new(common.clone()));
-        }
-        for _ in 0..20 {
-            rb.try_pop();
-        }
-        for _ in 0..20 {
-            rb.try_push(Tester::new(common.clone()));
+            receiver.try_pop();
         }
         assert_eq!(*common.borrow(), 40);
-        drop(rb);
+
+        drop(sender);
+        drop(receiver);
+        assert_eq!(*common.borrow(), 0);
+
+        let (mut sender, mut receiver) = with_capacity(50);
+        for _ in 0..50 {
+            sender.try_push(Tester::new(common.clone()));
+        }
+        for _ in 0..20 {
+            receiver.try_pop();
+        }
+        for _ in 0..25 {
+            sender.try_push(Tester::new(common.clone()));
+        }
+        assert_eq!(*common.borrow(), 55);
+
+        drop(sender);
+        drop(receiver);
         assert_eq!(*common.borrow(), 0);
     }
 
-    #[test]
-    fn test_send() {
-        let rb = SyncRingBuf::<i32>::with_capacity(10);
-        for i in 0..10 {
-            rb.try_push(i);
-        }
-        let tj = std::thread::spawn(move || {
-            let new_rb = rb;
-            assert_eq!(new_rb.try_pop(), Some(0));
-        });
+    // #[test]
+    // fn test_send() {
+    //     // SyncRingBuf is not inherently sendable because it contains
+    //     // a *mut T
+    //     let rb = SyncRingBuf::<i32>::with_capacity(10);
+    //     for i in 0..10 {
+    //         rb.try_push(i);
+    //     }
+    //     let tj = std::thread::spawn(move || {
+    //         let new_rb = rb;
+    //         assert_eq!(new_rb.try_pop(), Some(0));
+    //     });
 
-        assert_eq!(tj.join().is_ok(), true);
-    }
+    //     assert_eq!(tj.join().is_ok(), true);
+    // }
 
     #[test]
     fn test_sync() {
         let rb_ref = &RB;
         let n = 10000000;
 
-        let tj = std::thread::spawn(move ||{
+        let _tj = std::thread::spawn(move || {
             let mut counter = 0;
             loop {
                 if let Some(v) = rb_ref.try_pop() {
                     assert_eq!(v, counter);
                     counter += 1;
-                }
 
-                if counter == n {
-                    break;
+                    if counter == n {
+                        break;
+                    }
                 }
             }
         });
@@ -268,6 +303,24 @@ mod tests {
             while let Some(_) = RB.try_push(i) {}
         }
 
-        assert_eq!(tj.join().is_ok(), true);
+        // assert_eq!(tj.join().is_ok(), true);
+    }
+
+    #[test]
+    fn test_threaded() {
+        let (mut p, mut c) = with_capacity(500);
+        let n = 10000000;
+        std::thread::spawn(move || {
+            for i in 0..n {
+                while let None = p.try_push(i) {}
+            }
+        });
+
+        for i in 0..n {
+            while let Some(t) = c.try_pop() {
+                assert_eq!(t, i);
+                break
+            }
+        }
     }
 }
