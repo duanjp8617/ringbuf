@@ -1,15 +1,13 @@
-mod bootstrap;
 use std::{
     cell::Cell,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
-pub use bootstrap::RingBuf;
-
-mod spsc;
-
 #[repr(C)]
-pub struct SyncRingBuf<T> {
+struct SyncRingBuf<T> {
     // first cacheline
     buf: *mut T,
     buf_len: usize,
@@ -29,7 +27,7 @@ pub struct SyncRingBuf<T> {
 unsafe impl<T: Sync> Sync for SyncRingBuf<T> {}
 
 impl<T> SyncRingBuf<T> {
-    pub fn with_capacity_at_least(cap_at_least: usize) -> Self {
+    fn with_capacity_at_least(cap_at_least: usize) -> Self {
         assert!(cap_at_least > 1, "invalid capacity size");
 
         let cap_power_of_two = cap_at_least.next_power_of_two();
@@ -61,7 +59,7 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
-    pub fn try_push(&self, t: T) -> Option<T> {
+    fn try_push(&self, t: T) -> Option<T> {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let next_write_idx = curr_write_idx + 1 & self.cap;
 
@@ -80,7 +78,7 @@ impl<T> SyncRingBuf<T> {
         None
     }
 
-    pub fn try_pop(&self) -> Option<T> {
+    fn try_pop(&self) -> Option<T> {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
 
         if curr_read_idx == self.local_write_idx.get() {
@@ -106,6 +104,37 @@ impl<T> Drop for SyncRingBuf<T> {
             Vec::from_raw_parts(self.buf, 0, self.buf_len);
         }
     }
+}
+
+pub struct Producer<T> {
+    inner: Arc<SyncRingBuf<T>>,
+}
+
+unsafe impl<T: Send> Send for Producer<T> {}
+
+impl<T> Producer<T> {
+    pub fn try_push(&mut self, t: T) -> Option<T> {
+        (*self.inner).try_push(t)
+    }
+}
+
+pub struct Consumer<T> {
+    inner: Arc<SyncRingBuf<T>>,
+}
+
+unsafe impl<T: Send> Send for Consumer<T> {}
+
+impl<T> Consumer<T> {
+    pub fn try_pop(&mut self) -> Option<T> {
+        (*self.inner).try_pop()
+    }
+}
+
+pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Producer<T>, Consumer<T>) {
+    let rb = Arc::new(SyncRingBuf::with_capacity_at_least(cap_at_least));
+    let p = Producer { inner: rb.clone() };
+    let c = Consumer { inner: rb };
+    (p, c)
 }
 
 #[cfg(test)]
@@ -137,5 +166,25 @@ mod tests {
 
         assert_eq!(read_index_addr - base_addr, 64);
         assert_eq!(write_index_addr - base_addr, 128);
+    }
+
+    #[test]
+    fn test_threaded() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+        std::thread::spawn(move || {
+            for i in 0..n {
+                while let Some(_) = p.try_push(i) {}
+            }
+        });
+
+        for i in 0..n {
+            let res = loop {
+                if let Some(res) = c.try_pop() {
+                    break res;
+                }
+            };
+            assert_eq!(res, i);
+        }
     }
 }
