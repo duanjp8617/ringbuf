@@ -139,7 +139,7 @@ pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Producer<T>, Consumer<
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::{mem::size_of, thread::spawn};
 
     use super::*;
 
@@ -186,5 +186,48 @@ mod tests {
             };
             assert_eq!(res, i);
         }
+    }
+
+    #[test]
+    fn fixed_producer() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+        std::thread::spawn(move || {
+            for i in 0..n {
+                while let Some(_) = p.try_push(i) {}
+            }
+        });
+
+        let total_threads = 4;
+        let count = n / total_threads;
+
+        let closure = move |tid: i32, c: &mut Consumer<i32>| {
+            for i in (tid * count)..((tid + 1) * count) {
+                let res = loop {
+                    if let Some(res) = c.try_pop() {
+                        break res;
+                    }
+                };
+                assert_eq!(res, i);
+            }
+        };
+
+        let jh = std::thread::spawn(move || {
+            closure(0, &mut c);
+            let jh = std::thread::spawn(move|| {
+                closure(1, &mut c);
+                let jh = std::thread::spawn(move|| {
+                    closure(2, &mut c);
+                    let jh = std::thread::spawn(move|| {
+                        closure(3, &mut c);
+                    });
+                    jh.join().unwrap();
+                });
+                jh.join().unwrap();
+            });
+            jh.join().unwrap();
+        });
+
+        jh.join().unwrap();
     }
 }
