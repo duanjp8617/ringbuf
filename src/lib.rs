@@ -1,10 +1,6 @@
-use std::{
-    cell::Cell,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 #[repr(C)]
 struct SyncRingBuf<T> {
@@ -94,6 +90,26 @@ impl<T> SyncRingBuf<T> {
             .store((curr_read_idx + 1) & self.cap, Ordering::Release);
         Some(t)
     }
+
+    fn push_batch_slow(&self, batch: &mut Vec<T>) -> usize {
+        let batch_size = batch.len();
+        let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
+        let local_read_idx = self.local_read_idx.get();
+        
+        let vacant_size = if local_read_idx <= curr_write_idx {
+            // self.cap - (curr_write_idx - local_read_idx)
+            self.cap - curr_write_idx + local_read_idx
+        }
+        else {
+            // self.cap - (self.buf_len - local_read_idx + curr_write_idx)
+            local_read_idx - curr_write_idx - 1
+        };
+
+
+
+
+        0
+    }
 }
 
 impl<T> Drop for SyncRingBuf<T> {
@@ -139,7 +155,7 @@ pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Producer<T>, Consumer<
 
 #[cfg(test)]
 mod tests {
-    use std::{mem::size_of, thread::spawn};
+    use std::mem::size_of;
 
     use super::*;
 
@@ -169,10 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn test_threaded() {
+    fn two_threaded() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
-        std::thread::spawn(move || {
+        let jh = std::thread::spawn(move || {
             for i in 0..n {
                 while let Some(_) = p.try_push(i) {}
             }
@@ -186,6 +202,8 @@ mod tests {
             };
             assert_eq!(res, i);
         }
+
+        jh.join().unwrap();
     }
 
     #[test]
@@ -214,11 +232,11 @@ mod tests {
 
         let jh = std::thread::spawn(move || {
             closure(0, &mut c);
-            let jh = std::thread::spawn(move|| {
+            let jh = std::thread::spawn(move || {
                 closure(1, &mut c);
-                let jh = std::thread::spawn(move|| {
+                let jh = std::thread::spawn(move || {
                     closure(2, &mut c);
-                    let jh = std::thread::spawn(move|| {
+                    let jh = std::thread::spawn(move || {
                         closure(3, &mut c);
                     });
                     jh.join().unwrap();
