@@ -1,5 +1,8 @@
 mod bootstrap;
-use std::{cell::Cell, sync::atomic::AtomicUsize};
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 pub use bootstrap::RingBuf;
 
@@ -57,24 +60,82 @@ impl<T> SyncRingBuf<T> {
             padding3: [0; 6],
         }
     }
+
+    pub fn try_push(&self, t: T) -> Option<T> {
+        let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
+        let next_write_idx = curr_write_idx + 1 & self.cap;
+
+        if next_write_idx == self.local_read_idx.get() {
+            self.local_read_idx
+                .set(self.read_idx.load(Ordering::Acquire));
+            if next_write_idx == self.local_read_idx.get() {
+                return Some(t);
+            }
+        }
+
+        unsafe {
+            std::ptr::write(self.buf.add(curr_write_idx), t);
+        }
+        self.write_idx.store(next_write_idx, Ordering::Release);
+        None
+    }
+
+    pub fn try_pop(&self) -> Option<T> {
+        let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
+
+        if curr_read_idx == self.local_write_idx.get() {
+            self.local_write_idx
+                .set(self.write_idx.load(Ordering::Acquire));
+            if curr_read_idx == self.local_write_idx.get() {
+                return None;
+            }
+        }
+
+        let t = unsafe { std::ptr::read(self.buf.add(curr_read_idx)) };
+        self.read_idx
+            .store((curr_read_idx + 1) & self.cap, Ordering::Release);
+        Some(t)
+    }
+}
+
+impl<T> Drop for SyncRingBuf<T> {
+    fn drop(&mut self) {
+        while let Some(_) = self.try_pop() {}
+
+        unsafe {
+            Vec::from_raw_parts(self.buf, 0, self.buf_len);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use super::*;
 
     #[test]
     #[should_panic]
     fn super_large_capacity() {
-        let power = std::mem::size_of::<usize>() * 8 - 1;
-        let _b = SyncRingBuf::<i32>::with_capacity_at_least(
-            (2 as usize).pow(power as u32),
-        );
+        let _b = SyncRingBuf::<i32>::with_capacity_at_least((2 as usize).pow(63));
     }
 
     #[test]
     #[should_panic]
     fn capacity_of_one() {
         let _b = SyncRingBuf::<i32>::with_capacity_at_least(1);
+    }
+
+    #[test]
+    fn cache_aligned() {
+        assert_eq!(size_of::<SyncRingBuf<i32>>(), 192);
+        let empty_val = SyncRingBuf::<i32>::with_capacity_at_least(20);
+
+        let base_addr = &empty_val as *const SyncRingBuf<i32> as usize;
+        let read_index_addr = &empty_val.read_idx as *const AtomicUsize as usize;
+        let write_index_addr = &empty_val.write_idx as *const AtomicUsize as usize;
+
+        assert_eq!(read_index_addr - base_addr, 64);
+        assert_eq!(write_index_addr - base_addr, 128);
     }
 }
