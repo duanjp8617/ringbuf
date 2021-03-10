@@ -104,70 +104,70 @@ impl<T> Drop for RingBuf<T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{cell::RefCell, rc::Rc};
+// #[cfg(test)]
+// mod tests {
+//     use std::{cell::RefCell, rc::Rc};
 
-    use super::*;
+//     use super::*;
 
-    #[test]
-    fn push_pop() {
-        let mut rb = RingBuf::<i32>::new(5);
-        assert_eq!(rb.pop(), None);
+//     #[test]
+//     fn push_pop() {
+//         let mut rb = RingBuf::<i32>::new(5);
+//         assert_eq!(rb.pop(), None);
 
-        assert_eq!(rb.push(0), None);
-        assert_eq!(rb.pop(), Some(0));
+//         assert_eq!(rb.push(0), None);
+//         assert_eq!(rb.pop(), Some(0));
 
-        assert_eq!(rb.push(1), None);
-        assert_eq!(rb.pop(), Some(1));
+//         assert_eq!(rb.push(1), None);
+//         assert_eq!(rb.pop(), Some(1));
 
-        assert_eq!(rb.push(2), None);
-        assert_eq!(rb.pop(), Some(2));
+//         assert_eq!(rb.push(2), None);
+//         assert_eq!(rb.pop(), Some(2));
 
-        assert_eq!(rb.len(), 0);
+//         assert_eq!(rb.len(), 0);
 
-        for i in 0..5 {
-            assert_eq!(rb.push(i), None);
-            assert_eq!(rb.len(), i as usize + 1);
-        }
-        assert_eq!(rb.push(5), Some(5));
-        assert_eq!(rb.push(6), Some(6));
+//         for i in 0..5 {
+//             assert_eq!(rb.push(i), None);
+//             assert_eq!(rb.len(), i as usize + 1);
+//         }
+//         assert_eq!(rb.push(5), Some(5));
+//         assert_eq!(rb.push(6), Some(6));
 
-        for i in 0..5 {
-            assert_eq!(rb.pop(), Some(i));
-            assert_eq!(rb.len(), 4 - i as usize);
-        }
-        assert_eq!(rb.pop(), None);
-    }
+//         for i in 0..5 {
+//             assert_eq!(rb.pop(), Some(i));
+//             assert_eq!(rb.len(), 4 - i as usize);
+//         }
+//         assert_eq!(rb.pop(), None);
+//     }
 
-    #[test]
-    fn drop_test() {
-        struct Tester {
-            common: Rc<RefCell<i32>>,
-        }
+//     #[test]
+//     fn drop_test() {
+//         struct Tester {
+//             common: Rc<RefCell<i32>>,
+//         }
 
-        impl Tester {
-            fn new(common: Rc<RefCell<i32>>) -> Self {
-                *common.borrow_mut() += 1;
-                Self { common }
-            }
-        }
+//         impl Tester {
+//             fn new(common: Rc<RefCell<i32>>) -> Self {
+//                 *common.borrow_mut() += 1;
+//                 Self { common }
+//             }
+//         }
 
-        impl Drop for Tester {
-            fn drop(&mut self) {
-                *self.common.borrow_mut() -= 1;
-            }
-        }
+//         impl Drop for Tester {
+//             fn drop(&mut self) {
+//                 *self.common.borrow_mut() -= 1;
+//             }
+//         }
 
-        let common = Rc::new(RefCell::new(0));
-        let mut rb = RingBuf::new(100);
-        for _ in 0..100 {
-            rb.push(Tester::new(common.clone()));
-        }
-        assert_eq!(*common.borrow(), 100);
-        rb.pop();
-        assert_eq!(*common.borrow(), 99);
-        drop(rb);
-        assert_eq!(*common.borrow(), 0);
-    }
-}
+//         let common = Rc::new(RefCell::new(0));
+//         let mut rb = RingBuf::new(100);
+//         for _ in 0..100 {
+//             rb.push(Tester::new(common.clone()));
+//         }
+//         assert_eq!(*common.borrow(), 100);
+//         rb.pop();
+//         assert_eq!(*common.borrow(), 99);
+//         drop(rb);
+//         assert_eq!(*common.borrow(), 0);
+//     }
+// }
