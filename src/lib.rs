@@ -1,6 +1,6 @@
-use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::{cell::Cell, cmp::min};
 
 #[repr(C)]
 struct SyncRingBuf<T> {
@@ -91,24 +91,56 @@ impl<T> SyncRingBuf<T> {
         Some(t)
     }
 
-    fn push_batch_slow(&self, batch: &mut Vec<T>) -> usize {
-        let batch_size = batch.len();
-        let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
+    #[inline]
+    fn vacant_write_size(&self, curr_write_idx: usize) -> usize {
         let local_read_idx = self.local_read_idx.get();
-        
-        let vacant_size = if local_read_idx <= curr_write_idx {
-            // self.cap - (curr_write_idx - local_read_idx)
+
+        if local_read_idx <= curr_write_idx {
             self.cap - curr_write_idx + local_read_idx
-        }
-        else {
-            // self.cap - (self.buf_len - local_read_idx + curr_write_idx)
+        } else {
             local_read_idx - curr_write_idx - 1
+        }
+    }
+
+    fn push_batch(&self, batch: &mut Vec<T>) -> usize {
+        let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
+        let mut vacant_size = self.vacant_write_size(curr_write_idx);
+        if vacant_size < batch.len() {
+            self.local_read_idx
+                .set(self.read_idx.load(Ordering::Acquire));
+            vacant_size = self.vacant_write_size(curr_write_idx);
+            if vacant_size == 0 {
+                return 0;
+            }
+        }
+        let batch_size = std::cmp::min(vacant_size, batch.len());
+        
+        let next_write_idx = (curr_write_idx + batch_size) & self.cap;
+        let second_half = if curr_write_idx + batch_size < self.buf_len {
+            0
+        } else {
+            next_write_idx
         };
+        let first_half = batch_size - second_half;
 
+        unsafe {
+            std::ptr::copy(batch.as_ptr(), self.buf.add(curr_write_idx), first_half);
+            std::ptr::copy(batch.as_ptr().add(first_half), self.buf, second_half);
+        
+            if batch_size < batch.len() {
+                let cp_src = batch.as_ptr().add(batch_size);
+                let cp_dst = batch.as_mut_ptr();
+                std::ptr::copy(cp_src, cp_dst, batch.len()-batch_size);            
+                batch.set_len(batch.len()-batch_size);
+            }
+            else {
+                batch.set_len(0);
+            }
+        }
 
+        self.write_idx.store(next_write_idx, Ordering::Release);
 
-
-        0
+        batch_size
     }
 }
 
@@ -130,7 +162,7 @@ unsafe impl<T: Send> Send for Producer<T> {}
 
 impl<T> Producer<T> {
     pub fn try_push(&mut self, t: T) -> Option<T> {
-        (*self.inner).try_push(t)
+        self.inner.try_push(t)
     }
 }
 
@@ -142,7 +174,7 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T> Consumer<T> {
     pub fn try_pop(&mut self) -> Option<T> {
-        (*self.inner).try_pop()
+        self.inner.try_pop()
     }
 }
 
