@@ -102,10 +102,10 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
-    fn push_batch(&self, batch: &mut Vec<T>) -> usize {
+    unsafe fn push_batch(&self, batch_ptr: *const T, batch_len: usize) -> usize {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let mut vacant_size = self.vacant_write_size(curr_write_idx);
-        if vacant_size < batch.len() {
+        if vacant_size < batch_len {
             self.local_read_idx
                 .set(self.read_idx.load(Ordering::Acquire));
             vacant_size = self.vacant_write_size(curr_write_idx);
@@ -113,8 +113,8 @@ impl<T> SyncRingBuf<T> {
                 return 0;
             }
         }
-        let batch_size = std::cmp::min(vacant_size, batch.len());
-        
+        let batch_size = std::cmp::min(vacant_size, batch_len);
+
         let next_write_idx = (curr_write_idx + batch_size) & self.cap;
         let second_half = if curr_write_idx + batch_size < self.buf_len {
             0
@@ -123,22 +123,49 @@ impl<T> SyncRingBuf<T> {
         };
         let first_half = batch_size - second_half;
 
-        unsafe {
-            std::ptr::copy(batch.as_ptr(), self.buf.add(curr_write_idx), first_half);
-            std::ptr::copy(batch.as_ptr().add(first_half), self.buf, second_half);
-        
-            if batch_size < batch.len() {
-                let cp_src = batch.as_ptr().add(batch_size);
-                let cp_dst = batch.as_mut_ptr();
-                std::ptr::copy(cp_src, cp_dst, batch.len()-batch_size);            
-                batch.set_len(batch.len()-batch_size);
-            }
-            else {
-                batch.set_len(0);
-            }
-        }
+        std::ptr::copy(batch_ptr, self.buf.add(curr_write_idx), first_half);
+        std::ptr::copy(batch_ptr.add(first_half), self.buf, second_half);
 
         self.write_idx.store(next_write_idx, Ordering::Release);
+
+        batch_size
+    }
+
+    #[inline]
+    fn available_read_size(&self, curr_read_idx: usize) -> usize {
+        let local_write_idx = self.local_write_idx.get();
+        if curr_read_idx <= local_write_idx {
+            local_write_idx - curr_read_idx
+        } else {
+            self.buf_len - curr_read_idx + local_write_idx
+        }
+    }
+
+    unsafe fn pop_batch(&self, batch_ptr: *mut T, batch_cap: usize) -> usize {
+        let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
+        let mut available_size = self.available_read_size(curr_read_idx);
+        if available_size < batch_cap {
+            self.local_write_idx
+                .set(self.write_idx.load(Ordering::Acquire));
+            available_size = self.available_read_size(curr_read_idx);
+            if available_size == 0 {
+                return 0;
+            }
+        }
+        let batch_size = std::cmp::min(available_size, batch_cap);
+
+        let next_read_idx = (curr_read_idx + batch_size) & self.cap;
+        let second_half = if curr_read_idx + batch_size < self.buf_len {
+            0
+        } else {
+            next_read_idx
+        };
+        let first_half = batch_size - second_half;
+
+        std::ptr::copy(self.buf.add(curr_read_idx), batch_ptr, first_half);
+        std::ptr::copy(self.buf, batch_ptr.add(first_half), second_half);
+
+        self.read_idx.store(next_read_idx, Ordering::Release);
 
         batch_size
     }
