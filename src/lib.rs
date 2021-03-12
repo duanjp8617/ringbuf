@@ -74,31 +74,15 @@ impl<T> SyncRingBuf<T> {
         None
     }
 
-    fn try_pop(&self) -> Option<T> {
-        let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
-
-        if curr_read_idx == self.local_write_idx.get() {
-            self.local_write_idx
-                .set(self.write_idx.load(Ordering::Acquire));
-            if curr_read_idx == self.local_write_idx.get() {
-                return None;
-            }
-        }
-
-        let t = unsafe { std::ptr::read(self.buf.add(curr_read_idx)) };
-        self.read_idx
-            .store((curr_read_idx + 1) & self.cap, Ordering::Release);
-        Some(t)
-    }
-
-    #[inline]
-    fn vacant_write_size(&self, curr_write_idx: usize) -> usize {
-        let local_read_idx = self.local_read_idx.get();
-
-        if local_read_idx <= curr_write_idx {
-            self.cap - curr_write_idx + local_read_idx
+    fn remaining_at_least(&self) -> usize {
+        let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
+        let vacant_size = self.vacant_write_size(curr_write_idx);
+        if vacant_size == 0 {
+            self.local_read_idx
+                .set(self.read_idx.load(Ordering::Acquire));
+            self.vacant_write_size(curr_write_idx)
         } else {
-            local_read_idx - curr_write_idx - 1
+            vacant_size
         }
     }
 
@@ -131,13 +115,32 @@ impl<T> SyncRingBuf<T> {
         batch_size
     }
 
-    #[inline]
-    fn available_read_size(&self, curr_read_idx: usize) -> usize {
-        let local_write_idx = self.local_write_idx.get();
-        if curr_read_idx <= local_write_idx {
-            local_write_idx - curr_read_idx
+    fn try_pop(&self) -> Option<T> {
+        let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
+
+        if curr_read_idx == self.local_write_idx.get() {
+            self.local_write_idx
+                .set(self.write_idx.load(Ordering::Acquire));
+            if curr_read_idx == self.local_write_idx.get() {
+                return None;
+            }
+        }
+
+        let t = unsafe { std::ptr::read(self.buf.add(curr_read_idx)) };
+        self.read_idx
+            .store((curr_read_idx + 1) & self.cap, Ordering::Release);
+        Some(t)
+    }
+
+    fn len_at_least(&self) -> usize {
+        let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
+        let available_size = self.available_read_size(curr_read_idx);
+        if available_size == 0 {
+            self.local_write_idx
+                .set(self.write_idx.load(Ordering::Acquire));
+            self.available_read_size(curr_read_idx)
         } else {
-            self.buf_len - curr_read_idx + local_write_idx
+            available_size
         }
     }
 
@@ -169,6 +172,27 @@ impl<T> SyncRingBuf<T> {
 
         batch_size
     }
+
+    #[inline]
+    fn vacant_write_size(&self, curr_write_idx: usize) -> usize {
+        let local_read_idx = self.local_read_idx.get();
+
+        if local_read_idx <= curr_write_idx {
+            self.cap - curr_write_idx + local_read_idx
+        } else {
+            local_read_idx - curr_write_idx - 1
+        }
+    }
+
+    #[inline]
+    fn available_read_size(&self, curr_read_idx: usize) -> usize {
+        let local_write_idx = self.local_write_idx.get();
+        if curr_read_idx <= local_write_idx {
+            local_write_idx - curr_read_idx
+        } else {
+            self.buf_len - curr_read_idx + local_write_idx
+        }
+    }
 }
 
 impl<T> Drop for SyncRingBuf<T> {
@@ -191,6 +215,38 @@ impl<T> Producer<T> {
     pub fn try_push(&mut self, t: T) -> Option<T> {
         self.inner.try_push(t)
     }
+
+    pub fn remaining_at_least(&self) -> usize {
+        self.inner.remaining_at_least()
+    }
+
+    pub fn push_batch(&mut self, batch: &mut Vec<T>) -> usize {
+        let batch_len = batch.len();
+        let n_pushed = unsafe { self.inner.push_batch(batch.as_ptr(), batch_len) };
+        if n_pushed == 0 {
+            return 0;
+        }
+
+        unsafe {
+            if n_pushed < batch_len {
+                let src = batch.as_ptr().add(n_pushed);
+                let dst = batch.as_mut_ptr();
+                std::ptr::copy(src, dst, batch_len - n_pushed);
+            }
+            batch.set_len(batch_len - n_pushed);
+        }
+
+        n_pushed
+    }
+
+    pub fn push_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
+        let batch_size = std::cmp::min(self.remaining_at_least(), batch.len());
+        let drain = batch.drain(0..batch_size);
+        for t in drain {
+            assert!(self.try_push(t).is_none() == true, "this should not happen");
+        }
+        batch_size
+    }
 }
 
 pub struct Consumer<T> {
@@ -202,6 +258,37 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 impl<T> Consumer<T> {
     pub fn try_pop(&mut self) -> Option<T> {
         self.inner.try_pop()
+    }
+
+    pub fn len_at_least(&self) -> usize {
+        self.inner.len_at_least()
+    }
+
+    pub fn pop_batch(&mut self, batch: &mut Vec<T>) -> usize {
+        let batch_len = batch.len();
+        let batch_cap = batch.capacity();
+        let n_popped = unsafe {
+            self.inner
+                .pop_batch(batch.as_mut_ptr().add(batch_len), batch_cap - batch_len)
+        };
+
+        if n_popped == 0 {
+            0
+        } else {
+            unsafe {
+                batch.set_len(batch_len + n_popped);
+            }
+            n_popped
+        }
+    }
+
+    pub fn pop_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
+        let batch_size = std::cmp::min(self.len_at_least(), batch.capacity() - batch.len());
+        for _ in 0..batch_size {
+            let t = self.try_pop().expect("this should not happen");
+            batch.push(t);
+        }
+        batch_size
     }
 }
 
