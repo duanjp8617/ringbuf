@@ -439,4 +439,68 @@ mod tests {
 
         jh.join().unwrap();
     }
+
+    #[test]
+    fn fix_nothing() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+
+        let c_total_threads = 4;
+        let count = n / c_total_threads;
+
+        let closure = move |tid: i32, c: &mut Consumer<i32>| {
+            for i in (tid * count)..((tid + 1) * count) {
+                let res = pop(c);
+                assert_eq!(res, i);
+            }
+        };
+
+        let c_jh = std::thread::spawn(move || {
+            closure(0, &mut c);
+            let jh = std::thread::spawn(move || {
+                closure(1, &mut c);
+                let jh = std::thread::spawn(move || {
+                    closure(2, &mut c);
+                    let jh = std::thread::spawn(move || {
+                        closure(3, &mut c);
+                    });
+                    jh.join().unwrap();
+                });
+                jh.join().unwrap();
+            });
+            jh.join().unwrap();
+        });
+
+        let p_total_threads = 5;
+        let count = n / p_total_threads;
+
+        let closure = move |tid: i32, p: &mut Producer<i32>| {
+            for i in (tid * count)..((tid + 1) * count) {
+                push(p, i);
+            }
+        };
+
+        let p_jh = std::thread::spawn(move || {
+            closure(0, &mut p);
+            let jh = std::thread::spawn(move || {
+                closure(1, &mut p);
+                let jh = std::thread::spawn(move || {
+                    closure(2, &mut p);
+                    let jh = std::thread::spawn(move || {
+                        closure(3, &mut p);
+                        let jh = std::thread::spawn(move || {
+                            closure(4, &mut p);
+                        });
+                        jh.join().unwrap();
+                    });
+                    jh.join().unwrap();
+                });
+                jh.join().unwrap();
+            });
+            jh.join().unwrap();
+        });
+
+        p_jh.join().unwrap();
+        c_jh.join().unwrap();
+    }
 }
