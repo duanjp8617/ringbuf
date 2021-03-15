@@ -1,6 +1,6 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::{cell::Cell, cmp::min};
 
 #[repr(C)]
 struct SyncRingBuf<T> {
@@ -301,7 +301,7 @@ pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Producer<T>, Consumer<
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::{convert::TryInto, mem::size_of};
 
     use super::*;
 
@@ -330,22 +330,32 @@ mod tests {
         assert_eq!(write_index_addr - base_addr, 128);
     }
 
+    #[inline]
+    fn push(p: &mut Producer<i32>, i: i32) {
+        while let Some(_) = p.try_push(i) {}
+    }
+
+    #[inline]
+    fn pop(c: &mut Consumer<i32>) -> i32 {
+        loop {
+            if let Some(res) = c.try_pop() {
+                break res;
+            }
+        }
+    }
+
     #[test]
     fn two_threaded() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
         let jh = std::thread::spawn(move || {
             for i in 0..n {
-                while let Some(_) = p.try_push(i) {}
+                push(&mut p, i);
             }
         });
 
         for i in 0..n {
-            let res = loop {
-                if let Some(res) = c.try_pop() {
-                    break res;
-                }
-            };
+            let res = pop(&mut c);
             assert_eq!(res, i);
         }
 
@@ -358,7 +368,7 @@ mod tests {
         let n = 10000000;
         std::thread::spawn(move || {
             for i in 0..n {
-                while let Some(_) = p.try_push(i) {}
+                push(&mut p, i);
             }
         });
 
@@ -367,11 +377,7 @@ mod tests {
 
         let closure = move |tid: i32, c: &mut Consumer<i32>| {
             for i in (tid * count)..((tid + 1) * count) {
-                let res = loop {
-                    if let Some(res) = c.try_pop() {
-                        break res;
-                    }
-                };
+                let res = pop(c);
                 assert_eq!(res, i);
             }
         };
@@ -384,6 +390,45 @@ mod tests {
                     closure(2, &mut c);
                     let jh = std::thread::spawn(move || {
                         closure(3, &mut c);
+                    });
+                    jh.join().unwrap();
+                });
+                jh.join().unwrap();
+            });
+            jh.join().unwrap();
+        });
+
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn fixed_consumer() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+        std::thread::spawn(move || {
+            for i in 0..n {
+                let res = pop(&mut c);
+                assert_eq!(res, i);
+            }
+        });
+
+        let total_threads = 4;
+        let count = n / total_threads;
+
+        let closure = move |tid: i32, p: &mut Producer<i32>| {
+            for i in (tid * count)..((tid + 1) * count) {
+                push(p, i);
+            }
+        };
+
+        let jh = std::thread::spawn(move || {
+            closure(0, &mut p);
+            let jh = std::thread::spawn(move || {
+                closure(1, &mut p);
+                let jh = std::thread::spawn(move || {
+                    closure(2, &mut p);
+                    let jh = std::thread::spawn(move || {
+                        closure(3, &mut p);
                     });
                     jh.join().unwrap();
                 });
