@@ -57,11 +57,11 @@ impl<T> SyncRingBuf<T> {
 
     fn try_push(&self, t: T) -> Option<T> {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
-        let next_write_idx = curr_write_idx + 1 & self.cap;
+        let next_write_idx = (curr_write_idx + 1) & self.cap;
 
         if next_write_idx == self.local_read_idx.get() {
             self.local_read_idx
-                .set(self.read_idx.load(Ordering::Acquire));
+                .set(self.read_idx.load(Ordering::Relaxed));
             if next_write_idx == self.local_read_idx.get() {
                 return Some(t);
             }
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn two_threaded() {
         let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 100000000;
+        let n = 10000000;
         let jh = std::thread::spawn(move || {
             for i in 0..n {
                 push(&mut p, i);
