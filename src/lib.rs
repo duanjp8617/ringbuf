@@ -74,6 +74,7 @@ impl<T> SyncRingBuf<T> {
         None
     }
 
+    #[inline]
     fn remaining_at_least(&self) -> usize {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let vacant_size = self.vacant_write_size(curr_write_idx);
@@ -132,6 +133,7 @@ impl<T> SyncRingBuf<T> {
         Some(t)
     }
 
+    #[inline]
     fn len_at_least(&self) -> usize {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
         let available_size = self.available_read_size(curr_read_idx);
@@ -347,7 +349,7 @@ mod tests {
     #[test]
     fn two_threaded() {
         let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 10000000;
+        let n = 100000000;
         let jh = std::thread::spawn(move || {
             for i in 0..n {
                 push(&mut p, i);
@@ -502,5 +504,94 @@ mod tests {
 
         p_jh.join().unwrap();
         c_jh.join().unwrap();
+    }
+
+    #[test]
+    fn batched_pop() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+        let jh = std::thread::spawn(move || {
+            for i in 0..n {
+                push(&mut p, i);
+            }
+        });
+
+        let mut v = Vec::with_capacity(32);
+        let mut counter = 0;
+        loop {
+            let n_popped = c.pop_batch(&mut v);
+            for i in v.drain(0..n_popped) {
+                assert_eq!(i, counter);
+                counter += 1;
+            }
+            if counter == n {
+                break;
+            }
+        }
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn batched_push() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 10000000;
+        let jh = std::thread::spawn(move || {
+            let mut v = Vec::with_capacity(32);
+            let mut counter = 0;
+            while counter < n {
+                if v.len() < 32 {
+                    v.push(counter);
+                    counter += 1;
+                } else {
+                    p.push_batch(&mut v);
+                }
+            }
+            while v.len() > 0 {
+                p.push_batch(&mut v);
+            }
+        });
+
+        for i in 0..n {
+            let res = pop(&mut c);
+            assert_eq!(res, i);
+        }
+
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn batched_push_pop() {
+        let (mut p, mut c) = with_capacity_at_least(500);
+        let n = 100000000;
+
+        let jh = std::thread::spawn(move || {
+            let mut v = Vec::with_capacity(32);
+            let mut counter = 0;
+            while counter < n {
+                if v.len() < 32 {
+                    v.push(counter);
+                    counter += 1;
+                } else {
+                    p.push_batch(&mut v);
+                }
+            }
+            while v.len() > 0 {
+                p.push_batch(&mut v);
+            }
+        });
+
+        let mut v = Vec::with_capacity(32);
+        let mut counter = 0;
+        loop {
+            let n_popped = c.pop_batch(&mut v);
+            for i in v.drain(0..n_popped) {
+                assert_eq!(i, counter);
+                counter += 1;
+            }
+            if counter == n {
+                break;
+            }
+        }
+        jh.join().unwrap();
     }
 }
