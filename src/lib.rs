@@ -55,7 +55,7 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
-    fn try_push(&self, t: T) -> Option<T> {
+    fn try_send(&self, t: T) -> Option<T> {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let next_write_idx = (curr_write_idx + 1) & self.cap;
 
@@ -87,7 +87,7 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
-    unsafe fn push_batch(&self, batch_ptr: *const T, batch_len: usize) -> usize {
+    unsafe fn send_batch(&self, batch_ptr: *const T, batch_len: usize) -> usize {
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let mut vacant_size = self.vacant_write_size(curr_write_idx);
         if vacant_size < batch_len {
@@ -116,7 +116,7 @@ impl<T> SyncRingBuf<T> {
         batch_size
     }
 
-    fn try_pop(&self) -> Option<T> {
+    fn try_recv(&self) -> Option<T> {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
 
         if curr_read_idx == self.local_write_idx.get() {
@@ -146,7 +146,7 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
-    unsafe fn pop_batch(&self, batch_ptr: *mut T, batch_cap: usize) -> usize {
+    unsafe fn recv_batch(&self, batch_ptr: *mut T, batch_cap: usize) -> usize {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
         let mut available_size = self.available_read_size(curr_read_idx);
         if available_size < batch_cap {
@@ -199,7 +199,7 @@ impl<T> SyncRingBuf<T> {
 
 impl<T> Drop for SyncRingBuf<T> {
     fn drop(&mut self) {
-        while let Some(_) = self.try_pop() {}
+        while let Some(_) = self.try_recv() {}
 
         unsafe {
             Vec::from_raw_parts(self.buf, 0, self.buf_len);
@@ -207,24 +207,24 @@ impl<T> Drop for SyncRingBuf<T> {
     }
 }
 
-pub struct Producer<T> {
+pub struct Sender<T> {
     inner: Arc<SyncRingBuf<T>>,
 }
 
-unsafe impl<T: Send> Send for Producer<T> {}
+unsafe impl<T: Send> Send for Sender<T> {}
 
-impl<T> Producer<T> {
-    pub fn try_push(&mut self, t: T) -> Option<T> {
-        self.inner.try_push(t)
+impl<T> Sender<T> {
+    pub fn try_send(&mut self, t: T) -> Option<T> {
+        self.inner.try_send(t)
     }
 
     pub fn remaining_at_least(&self) -> usize {
         self.inner.remaining_at_least()
     }
 
-    pub fn push_batch(&mut self, batch: &mut Vec<T>) -> usize {
+    pub fn send_batch(&mut self, batch: &mut Vec<T>) -> usize {
         let batch_len = batch.len();
-        let n_pushed = unsafe { self.inner.push_batch(batch.as_ptr(), batch_len) };
+        let n_pushed = unsafe { self.inner.send_batch(batch.as_ptr(), batch_len) };
         if n_pushed == 0 {
             return 0;
         }
@@ -241,37 +241,37 @@ impl<T> Producer<T> {
         n_pushed
     }
 
-    pub fn push_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
+    pub fn send_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
         let batch_size = std::cmp::min(self.remaining_at_least(), batch.len());
         let drain = batch.drain(0..batch_size);
         for t in drain {
-            assert!(self.try_push(t).is_none() == true, "this should not happen");
+            assert!(self.try_send(t).is_none() == true, "this should not happen");
         }
         batch_size
     }
 }
 
-pub struct Consumer<T> {
+pub struct Receiver<T> {
     inner: Arc<SyncRingBuf<T>>,
 }
 
-unsafe impl<T: Send> Send for Consumer<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
 
-impl<T> Consumer<T> {
-    pub fn try_pop(&mut self) -> Option<T> {
-        self.inner.try_pop()
+impl<T> Receiver<T> {
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.inner.try_recv()
     }
 
     pub fn len_at_least(&self) -> usize {
         self.inner.len_at_least()
     }
 
-    pub fn pop_batch(&mut self, batch: &mut Vec<T>) -> usize {
+    pub fn recv_batch(&mut self, batch: &mut Vec<T>) -> usize {
         let batch_len = batch.len();
         let batch_cap = batch.capacity();
         let n_popped = unsafe {
             self.inner
-                .pop_batch(batch.as_mut_ptr().add(batch_len), batch_cap - batch_len)
+                .recv_batch(batch.as_mut_ptr().add(batch_len), batch_cap - batch_len)
         };
 
         if n_popped == 0 {
@@ -284,26 +284,26 @@ impl<T> Consumer<T> {
         }
     }
 
-    pub fn pop_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
+    pub fn recv_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
         let batch_size = std::cmp::min(self.len_at_least(), batch.capacity() - batch.len());
         for _ in 0..batch_size {
-            let t = self.try_pop().expect("this should not happen");
+            let t = self.try_recv().expect("this should not happen");
             batch.push(t);
         }
         batch_size
     }
 }
 
-pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Producer<T>, Consumer<T>) {
+pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Sender<T>, Receiver<T>) {
     let rb = Arc::new(SyncRingBuf::with_capacity_at_least(cap_at_least));
-    let p = Producer { inner: rb.clone() };
-    let c = Consumer { inner: rb };
+    let p = Sender { inner: rb.clone() };
+    let c = Receiver { inner: rb };
     (p, c)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::TryInto, mem::size_of};
+    use std::mem::size_of;
 
     use super::*;
 
@@ -333,14 +333,14 @@ mod tests {
     }
 
     #[inline]
-    fn push(p: &mut Producer<i32>, i: i32) {
-        while let Some(_) = p.try_push(i) {}
+    fn send(s: &mut Sender<i32>, i: i32) {
+        while let Some(_) = s.try_send(i) {}
     }
 
     #[inline]
-    fn pop(c: &mut Consumer<i32>) -> i32 {
+    fn recv(r: &mut Receiver<i32>) -> i32 {
         loop {
-            if let Some(res) = c.try_pop() {
+            if let Some(res) = r.try_recv() {
                 break res;
             }
         }
@@ -348,16 +348,16 @@ mod tests {
 
     #[test]
     fn two_threads() {
-        let (mut p, mut c) = with_capacity_at_least(500);
+        let (mut s, mut r) = with_capacity_at_least(500);
         let n = 10000000;
         let jh = std::thread::spawn(move || {
             for i in 0..n {
-                push(&mut p, i);
+                send(&mut s, i);
             }
         });
 
         for i in 0..n {
-            let res = pop(&mut c);
+            let res = recv(&mut r);
             assert_eq!(res, i);
         }
 
@@ -366,27 +366,27 @@ mod tests {
 
     #[test]
     fn send_around() {
-        let (mut p, mut c) = with_capacity_at_least(500);
+        let (mut s, mut r) = with_capacity_at_least(500);
         let n = 10000000;
 
-        let c_total_threads = 4;
-        let count = n / c_total_threads;
+        let r_total_threads = 4;
+        let count = n / r_total_threads;
 
-        let closure = move |tid: i32, c: &mut Consumer<i32>| {
+        let closure = move |tid: i32, r: &mut Receiver<i32>| {
             for i in (tid * count)..((tid + 1) * count) {
-                let res = pop(c);
+                let res = recv(r);
                 assert_eq!(res, i);
             }
         };
 
-        let c_jh = std::thread::spawn(move || {
-            closure(0, &mut c);
+        let r_jh = std::thread::spawn(move || {
+            closure(0, &mut r);
             let jh = std::thread::spawn(move || {
-                closure(1, &mut c);
+                closure(1, &mut r);
                 let jh = std::thread::spawn(move || {
-                    closure(2, &mut c);
+                    closure(2, &mut r);
                     let jh = std::thread::spawn(move || {
-                        closure(3, &mut c);
+                        closure(3, &mut r);
                     });
                     jh.join().unwrap();
                 });
@@ -395,25 +395,25 @@ mod tests {
             jh.join().unwrap();
         });
 
-        let p_total_threads = 5;
-        let count = n / p_total_threads;
+        let s_total_threads = 5;
+        let count = n / s_total_threads;
 
-        let closure = move |tid: i32, p: &mut Producer<i32>| {
+        let closure = move |tid: i32, s: &mut Sender<i32>| {
             for i in (tid * count)..((tid + 1) * count) {
-                push(p, i);
+                send(s, i);
             }
         };
 
-        let p_jh = std::thread::spawn(move || {
-            closure(0, &mut p);
+        let s_jh = std::thread::spawn(move || {
+            closure(0, &mut s);
             let jh = std::thread::spawn(move || {
-                closure(1, &mut p);
+                closure(1, &mut s);
                 let jh = std::thread::spawn(move || {
-                    closure(2, &mut p);
+                    closure(2, &mut s);
                     let jh = std::thread::spawn(move || {
-                        closure(3, &mut p);
+                        closure(3, &mut s);
                         let jh = std::thread::spawn(move || {
-                            closure(4, &mut p);
+                            closure(4, &mut s);
                         });
                         jh.join().unwrap();
                     });
@@ -424,13 +424,13 @@ mod tests {
             jh.join().unwrap();
         });
 
-        p_jh.join().unwrap();
-        c_jh.join().unwrap();
+        r_jh.join().unwrap();
+        s_jh.join().unwrap();
     }
 
     #[test]
     fn batched_two_threads() {
-        let (mut p, mut c) = with_capacity_at_least(500);
+        let (mut s, mut r) = with_capacity_at_least(500);
         let n = 10000000;
 
         let jh = std::thread::spawn(move || {
@@ -441,18 +441,18 @@ mod tests {
                     v.push(counter);
                     counter += 1;
                 } else {
-                    p.push_batch(&mut v);
+                    s.send_batch(&mut v);
                 }
             }
             while v.len() > 0 {
-                p.push_batch(&mut v);
+                s.send_batch(&mut v);
             }
         });
 
         let mut v = Vec::with_capacity(32);
         let mut counter = 0;
         loop {
-            let n_popped = c.pop_batch(&mut v);
+            let n_popped = r.recv_batch(&mut v);
             for i in v.drain(0..n_popped) {
                 assert_eq!(i, counter);
                 counter += 1;
@@ -461,6 +461,38 @@ mod tests {
                 break;
             }
         }
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn batched_small_queue() {
+        let (mut s, mut r) = with_capacity_at_least(10);
+
+        let jh = std::thread::spawn(move || {
+            let mut v = Vec::<i32>::with_capacity(500);
+            let mut curr_len = v.len();
+            while curr_len < 500 {
+                let n_recved = r.recv_batch(&mut v);
+                assert_eq!(curr_len + n_recved, v.len());
+                curr_len = v.len();
+            }
+            for i in 0..500 {
+                assert_eq!(i as i32, v[i]);
+            }
+        });
+
+        let mut v = Vec::with_capacity(500);
+        for i in 0..500 {
+            v.push(i);
+        }
+
+        let mut curr_len = v.len();
+        while curr_len > 0 {
+            let n_send = s.send_batch(&mut v);
+            assert_eq!(n_send + v.len(), curr_len);
+            curr_len = v.len();
+        }
+
         jh.join().unwrap();
     }
 }
