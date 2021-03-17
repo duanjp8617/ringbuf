@@ -350,7 +350,7 @@ mod tests {
     fn two_threaded() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
-        let jh = std::thread::spawn(move || {
+        std::thread::spawn(move || {
             for i in 0..n {
                 push(&mut p, i);
             }
@@ -360,8 +360,6 @@ mod tests {
             let res = pop(&mut c);
             assert_eq!(res, i);
         }
-
-        jh.join().unwrap();
     }
 
     #[test]
