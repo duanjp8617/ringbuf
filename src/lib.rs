@@ -223,19 +223,18 @@ impl<T> Sender<T> {
     }
 
     pub fn send_batch(&mut self, batch: &mut Vec<T>) -> usize {
-        let batch_len = batch.len();
-        let n_pushed = unsafe { self.inner.send_batch(batch.as_ptr(), batch_len) };
+        let n_pushed = unsafe { self.inner.send_batch(batch.as_ptr(), batch.len()) };
         if n_pushed == 0 {
             return 0;
         }
 
         unsafe {
-            if n_pushed < batch_len {
+            if n_pushed < batch.len() {
                 let src = batch.as_ptr().add(n_pushed);
                 let dst = batch.as_mut_ptr();
-                std::ptr::copy(src, dst, batch_len - n_pushed);
+                std::ptr::copy(src, dst, batch.len() - n_pushed);
             }
-            batch.set_len(batch_len - n_pushed);
+            batch.set_len(batch.len() - n_pushed);
         }
 
         n_pushed
@@ -267,18 +266,18 @@ impl<T> Receiver<T> {
     }
 
     pub fn recv_batch(&mut self, batch: &mut Vec<T>) -> usize {
-        let batch_len = batch.len();
-        let batch_cap = batch.capacity();
         let n_popped = unsafe {
-            self.inner
-                .recv_batch(batch.as_mut_ptr().add(batch_len), batch_cap - batch_len)
+            self.inner.recv_batch(
+                batch.as_mut_ptr().add(batch.len()),
+                batch.capacity() - batch.len(),
+            )
         };
 
         if n_popped == 0 {
             0
         } else {
             unsafe {
-                batch.set_len(batch_len + n_popped);
+                batch.set_len(batch.len() + n_popped);
             }
             n_popped
         }
@@ -303,7 +302,7 @@ pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Sender<T>, Receiver<T>
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
+    use std::{cell::RefCell, mem::size_of, rc::Rc};
 
     use super::*;
 
@@ -494,5 +493,74 @@ mod tests {
         }
 
         jh.join().unwrap();
+    }
+
+    #[test]
+    fn drop() {
+        struct Share {
+            inner: Rc<RefCell<i32>>,
+        }
+
+        impl Share {
+            fn new(share: Rc<RefCell<i32>>) -> Self {
+                *share.borrow_mut() += 1;
+                Self {
+                    inner: share
+                }                
+            }
+        }
+
+        impl Drop for Share {
+            fn drop(&mut self) {
+                *self.inner.borrow_mut() -= 1;
+            }
+        }
+
+        let share = Rc::new(RefCell::new(0));
+        let (mut s, mut r) = with_capacity_at_least(5);
+
+        assert_eq!(s.remaining_at_least(), 7);
+        assert_eq!(r.len_at_least(), 0);
+
+        s.try_send(Share::new(share.clone()));
+        s.try_send(Share::new(share.clone()));
+        s.try_send(Share::new(share.clone()));
+        s.try_send(Share::new(share.clone()));
+        s.try_send(Share::new(share.clone()));
+        assert_eq!(*share.borrow(), 5);
+
+        r.try_recv();
+        r.try_recv();
+        assert_eq!(*share.borrow(), 3);
+
+        let mut v = Vec::with_capacity(5);
+        for _ in 0..5 {
+            v.push(Share::new(share.clone()));
+        }
+        assert_eq!(*share.borrow(), 8);
+        
+        let n_send = s.send_batch(&mut v);
+        assert_eq!(n_send, 4);
+        assert_eq!(v.len(), 1);
+        assert_eq!(*share.borrow(), 8);
+
+        let n_recv = r.recv_batch(&mut v);
+        assert_eq!(n_recv, 4);
+        assert_eq!(v.len(), 5);
+        assert_eq!(*share.borrow(), 8);
+
+        v.clear();
+        assert_eq!(*share.borrow(), 3);
+
+        let n_recv = r.recv_batch(&mut v);
+        assert_eq!(n_recv, 3);
+
+        let n_send = s.send_batch(&mut v);
+        assert_eq!(n_send, 3);
+
+        assert_eq!(*share.borrow(), 3);
+        std::mem::drop(r);
+        std::mem::drop(s);
+        assert_eq!(*share.borrow(), 0);
     }
 }
