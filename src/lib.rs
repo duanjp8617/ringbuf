@@ -347,10 +347,10 @@ mod tests {
     }
 
     #[test]
-    fn two_threaded() {
+    fn two_threads() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
-        std::thread::spawn(move || {
+        let jh = std::thread::spawn(move || {
             for i in 0..n {
                 push(&mut p, i);
             }
@@ -360,88 +360,12 @@ mod tests {
             let res = pop(&mut c);
             assert_eq!(res, i);
         }
-    }
-
-    #[test]
-    fn fixed_producer() {
-        let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 10000000;
-        std::thread::spawn(move || {
-            for i in 0..n {
-                push(&mut p, i);
-            }
-        });
-
-        let total_threads = 4;
-        let count = n / total_threads;
-
-        let closure = move |tid: i32, c: &mut Consumer<i32>| {
-            for i in (tid * count)..((tid + 1) * count) {
-                let res = pop(c);
-                assert_eq!(res, i);
-            }
-        };
-
-        let jh = std::thread::spawn(move || {
-            closure(0, &mut c);
-            let jh = std::thread::spawn(move || {
-                closure(1, &mut c);
-                let jh = std::thread::spawn(move || {
-                    closure(2, &mut c);
-                    let jh = std::thread::spawn(move || {
-                        closure(3, &mut c);
-                    });
-                    jh.join().unwrap();
-                });
-                jh.join().unwrap();
-            });
-            jh.join().unwrap();
-        });
 
         jh.join().unwrap();
     }
 
     #[test]
-    fn fixed_consumer() {
-        let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 10000000;
-        std::thread::spawn(move || {
-            for i in 0..n {
-                let res = pop(&mut c);
-                assert_eq!(res, i);
-            }
-        });
-
-        let total_threads = 4;
-        let count = n / total_threads;
-
-        let closure = move |tid: i32, p: &mut Producer<i32>| {
-            for i in (tid * count)..((tid + 1) * count) {
-                push(p, i);
-            }
-        };
-
-        let jh = std::thread::spawn(move || {
-            closure(0, &mut p);
-            let jh = std::thread::spawn(move || {
-                closure(1, &mut p);
-                let jh = std::thread::spawn(move || {
-                    closure(2, &mut p);
-                    let jh = std::thread::spawn(move || {
-                        closure(3, &mut p);
-                    });
-                    jh.join().unwrap();
-                });
-                jh.join().unwrap();
-            });
-            jh.join().unwrap();
-        });
-
-        jh.join().unwrap();
-    }
-
-    #[test]
-    fn fix_nothing() {
+    fn send_around() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
 
@@ -505,62 +429,9 @@ mod tests {
     }
 
     #[test]
-    fn batched_pop() {
+    fn batched_two_threads() {
         let (mut p, mut c) = with_capacity_at_least(500);
         let n = 10000000;
-        let jh = std::thread::spawn(move || {
-            for i in 0..n {
-                push(&mut p, i);
-            }
-        });
-
-        let mut v = Vec::with_capacity(32);
-        let mut counter = 0;
-        loop {
-            let n_popped = c.pop_batch(&mut v);
-            for i in v.drain(0..n_popped) {
-                assert_eq!(i, counter);
-                counter += 1;
-            }
-            if counter == n {
-                break;
-            }
-        }
-        jh.join().unwrap();
-    }
-
-    #[test]
-    fn batched_push() {
-        let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 10000000;
-        let jh = std::thread::spawn(move || {
-            let mut v = Vec::with_capacity(32);
-            let mut counter = 0;
-            while counter < n {
-                if v.len() < 32 {
-                    v.push(counter);
-                    counter += 1;
-                } else {
-                    p.push_batch(&mut v);
-                }
-            }
-            while v.len() > 0 {
-                p.push_batch(&mut v);
-            }
-        });
-
-        for i in 0..n {
-            let res = pop(&mut c);
-            assert_eq!(res, i);
-        }
-
-        jh.join().unwrap();
-    }
-
-    #[test]
-    fn batched_push_pop() {
-        let (mut p, mut c) = with_capacity_at_least(500);
-        let n = 100000000;
 
         let jh = std::thread::spawn(move || {
             let mut v = Vec::with_capacity(32);
