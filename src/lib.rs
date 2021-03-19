@@ -2,21 +2,31 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+const CACHELINE_SIZE: usize = 64;
+const POINTER_SIZE: usize = 8;
+
+macro_rules! total_size {
+    ( $t: ty $(, $ts: ty)* $(,)? ) => {
+          std::mem::size_of::<$t>()
+          $( + std::mem::size_of::<$ts>() )*
+    }
+}
+
 #[repr(C)]
 struct SyncRingBuf<T> {
     // first cacheline
     buf: *mut T,
     buf_len: usize,
     cap: usize,
-    padding1: [usize; 5],
+    padding1: [u8; CACHELINE_SIZE - total_size!(usize, usize) - POINTER_SIZE],
     // second cacheline
     read_idx: AtomicUsize,
     local_write_idx: Cell<usize>,
-    padding2: [usize; 6],
+    padding2: [u8; CACHELINE_SIZE - total_size!(AtomicUsize, Cell<usize>)],
     // third cacheline
     write_idx: AtomicUsize,
     local_read_idx: Cell<usize>,
-    padding3: [usize; 6],
+    padding3: [u8; CACHELINE_SIZE - total_size!(AtomicUsize, Cell<usize>)],
 }
 
 // make SyncRingBuf<T> sync if T is sync
@@ -43,15 +53,15 @@ impl<T> SyncRingBuf<T> {
             buf,
             buf_len,
             cap: buf_len - 1,
-            padding1: [0; 5],
+            padding1: [0; 40],
             // second cacheline
             read_idx: AtomicUsize::new(0),
             local_write_idx: Cell::new(0),
-            padding2: [0; 6],
+            padding2: [0; 48],
             // third cacheline
             write_idx: AtomicUsize::new(0),
             local_read_idx: Cell::new(0),
-            padding3: [0; 6],
+            padding3: [0; 48],
         }
     }
 
@@ -195,6 +205,11 @@ impl<T> SyncRingBuf<T> {
             self.buf_len - curr_read_idx + local_write_idx
         }
     }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.cap
+    }
 }
 
 impl<T> Drop for SyncRingBuf<T> {
@@ -247,6 +262,10 @@ impl<T> Sender<T> {
             assert!(self.try_send(t).is_none() == true, "this should not happen");
         }
         batch_size
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
     }
 }
 
@@ -319,6 +338,15 @@ mod tests {
     }
 
     #[test]
+    fn capacity() {
+        let b = SyncRingBuf::<i32>::with_capacity_at_least(2);
+        assert_eq!(b.capacity(), 3);
+
+        let b = SyncRingBuf::<i32>::with_capacity_at_least(512);
+        assert_eq!(b.capacity(), 1023);
+    }
+
+    #[test]
     fn cache_aligned() {
         assert_eq!(size_of::<SyncRingBuf<i32>>(), 192);
         let empty_val = SyncRingBuf::<i32>::with_capacity_at_least(20);
@@ -332,12 +360,14 @@ mod tests {
     }
 
     #[inline]
-    fn send(s: &mut Sender<i32>, i: i32) {
-        while let Some(_) = s.try_send(i) {}
+    fn send<T>(s: &mut Sender<T>, mut i: T) {
+        while let Some(res) = s.try_send(i) {
+            i = res;
+        }
     }
 
     #[inline]
-    fn recv(r: &mut Receiver<i32>) -> i32 {
+    fn recv<T>(r: &mut Receiver<T>) -> T {
         loop {
             if let Some(res) = r.try_recv() {
                 break res;
@@ -504,9 +534,7 @@ mod tests {
         impl Share {
             fn new(share: Rc<RefCell<i32>>) -> Self {
                 *share.borrow_mut() += 1;
-                Self {
-                    inner: share
-                }                
+                Self { inner: share }
             }
         }
 
@@ -538,7 +566,7 @@ mod tests {
             v.push(Share::new(share.clone()));
         }
         assert_eq!(*share.borrow(), 8);
-        
+
         let n_send = s.send_batch(&mut v);
         assert_eq!(n_send, 4);
         assert_eq!(v.len(), 1);
@@ -562,5 +590,84 @@ mod tests {
         std::mem::drop(r);
         std::mem::drop(s);
         assert_eq!(*share.borrow(), 0);
+    }
+
+    #[test]
+    fn zero_sized_batch() {
+        let (mut s, mut r) = with_capacity_at_least(2);
+        let n = 100;
+
+        let jh = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            for _ in 0..n {
+                assert_eq!(s.send_batch(&mut v), 0);
+            }
+            send(&mut s, 5);
+            send(&mut s, 6);
+        });
+
+        let mut v = Vec::with_capacity(2);
+        v.push(5);
+        v.push(6);
+        for _ in 0..n {
+            assert_eq!(r.recv_batch(&mut v), 0);
+        }
+        assert_eq!(recv(&mut r), 5);
+        assert_eq!(recv(&mut r), 6);
+        
+        jh.join().unwrap();
+    }
+
+    #[test]
+    fn zero_sized_object() {
+        let (mut s, mut r) = with_capacity_at_least::<()>(500);
+        let n = 10000000;
+        let jh = std::thread::spawn(move || {
+            for _ in 0..n {
+                send(&mut s, ());
+            }
+        });
+
+        for _ in 0..n {
+            let res = recv(&mut r);
+            assert_eq!(res, ());
+        }
+
+        jh.join().unwrap();
+        assert_eq!(r.try_recv(), None);
+
+        let (mut s, mut r) = with_capacity_at_least::<()>(500);
+        let n = 10000000;
+
+        let jh = std::thread::spawn(move || {
+            let mut v = Vec::with_capacity(32);
+            let mut counter = 0;
+            while counter < n {
+                if v.len() < 32 {
+                    v.push(());
+                    counter += 1;
+                } else {
+                    s.send_batch(&mut v);
+                }
+            }
+            while v.len() > 0 {
+                s.send_batch(&mut v);
+            }
+        });
+
+        let mut v = Vec::with_capacity(32);
+        let mut counter = 0;
+        loop {
+            let n_popped = r.recv_batch(&mut v);
+            for i in v.drain(0..n_popped) {
+                assert_eq!(i, ());
+                counter += 1;
+            }
+            if counter == n {
+                break;
+            }
+        }
+
+        jh.join().unwrap();
     }
 }
