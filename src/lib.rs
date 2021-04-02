@@ -5,6 +5,7 @@ use std::sync::Arc;
 const CACHELINE_SIZE: usize = 64;
 const POINTER_SIZE: usize = 8;
 
+/// Define a macro to calculate memory occupation.
 macro_rules! total_size {
     ( $t: ty $(, $ts: ty)* $(,)? ) => {
           std::mem::size_of::<$t>()
@@ -12,6 +13,45 @@ macro_rules! total_size {
     }
 }
 
+/// The circular buffer field of single-producer single-consumer (spsc) buffer.
+///  
+/// This buffer is implemented based on raw pointer and composed of three cacheline.
+/// The first cacheline store the raw pointer of allocated buffer memory and it's 
+/// `length` and `capacity` (equal to length minus 1, for the `write_idx` point to the next 
+/// writable position, we need a unit to detect the full condition). The second 
+/// cacheline store the global read index and local write index (which is designed to 
+/// reduce the call of `load()` and `store()` function of atomic number. it have
+/// higher priority than global one in calculation, and only be updated to the lasted
+/// global value when reaching some illegal conditions), and so as the third cacheline.
+/// 
+/// #Examples
+/// 
+/// ```
+/// use SyncRingBuf::lib;
+/// 
+/// let srb = SyncRingBuf::with_capacity_at_least(2);
+/// 
+/// assert_eq!(srb.try_send(0), None);
+/// assert_eq!(srb.try_rcv(), Some(0));
+/// assert_eq!(srb.try_rcv(), None);
+/// ```
+/// 
+/// #Examples
+/// ```
+/// use SyncRingBuf::lib::SyncRingBuf;
+/// 
+/// let srb = SyncRingBuf::with_capacity_at_least(10);
+/// let data_send = Vec！(1, 2, 3).as_ptr();
+/// let data_recv  = Vec::with_capacity().as_mut_ptr();
+/// 
+/// unsafe {
+///     assert_eq!(srb.send_batch(data_send, 3), 3);
+///     assert_eq!(srb.send_batch(data_send, 1), 0);
+///     assert_eq!(srb.recv_batch(data_recv, 3), 3);
+///     assert_eq!(data_recv, Vec!(1, 2, 3).as_mut_ptr());
+///     assert_eq!(srb.recv_batch(data_recv, 1), 0);
+/// }
+/// ```
 #[repr(C)]
 struct SyncRingBuf<T> {
     // first cacheline
@@ -32,6 +72,21 @@ struct SyncRingBuf<T> {
 // make SyncRingBuf<T> sync if T is sync
 unsafe impl<T: Sync> Sync for SyncRingBuf<T> {}
 
+/// Creates a new `SyncRingBuf` struct with specified capacity at least. Particulatly the
+/// generated `capacity` is the next number in the sequence of power of 2 (2, 4 ,8...) minus 1. 
+/// 
+/// #Examples 
+/// 
+/// ```
+/// use SyncRingBuf::lib::SyncRingBuf;
+/// let srb = SyncRingBuf::with_capacity_at_least(2);
+/// assert_eq!(srb.cap, 3);//2^2 - 1
+/// let srb = SyncRingBuf::with_capacity_at_least(7);
+/// assert_eq!(srb.cap, 7);//2^3 - 1
+/// let srb = SyncRingBuf::with_capacity_at_least(16);
+/// assert_eq!(srb.cap, 31);//2^5 - 1
+/// ```
+/// Mind that the given `cap_at_least` should be greater than or qeual to 2
 impl<T> SyncRingBuf<T> {
     fn with_capacity_at_least(cap_at_least: usize) -> Self {
         assert!(cap_at_least > 1, "invalid capacity size");
@@ -65,10 +120,31 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
+    /// Pushes an element into the `SyncRingBuf`, returns `None` when success or 
+    /// `Some(T)` when fail.
+    /// 
+    /// #Examples
+    /// ```
+    /// use SyncRingBuf::lib::SyncRingBuf;
+    /// 
+    /// let srb = SyncRingBuf::with_capacity_at_least(2);
+    /// 
+    /// assert_eq!(srb.try_send(0), None);
+    /// assert_eq!(srb.try_send(0), Some(0));
+    /// assert_eq!(srb.try_rcv(), Some(0));
+    /// assert_eq!(srb.try_rcv(), None);
+    /// ```
     fn try_send(&self, t: T) -> Option<T> {
+        // get the current global write pointer and the next one. Since the capacity is 
+        // the power of 2, so we take “&” operator to fastly reset the next index to 0 if
+        // it reach the upper bound.
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let next_write_idx = (curr_write_idx + 1) & self.cap;
 
+        // if the next write pointer meet with local read pointer, that means we
+        // are going to conduct a illegal push in "local-full" queue, so we try to 
+        // update the local read pointer to see if we can get more position to push.
+        // if it's still full after update, we can judge it as "global-full" and return it.
         if next_write_idx == self.local_read_idx.get() {
             self.local_read_idx
                 .set(self.read_idx.load(Ordering::Relaxed));
@@ -77,6 +153,7 @@ impl<T> SyncRingBuf<T> {
             }
         }
 
+        //write the data and update the write pointer.
         unsafe {
             std::ptr::write(self.buf.add(curr_write_idx), t);
         }
@@ -85,9 +162,15 @@ impl<T> SyncRingBuf<T> {
     }
 
     #[inline]
+    /// Return the local-remaining writable capacity or larger global-remaining capacity.
     fn remaining_at_least(&self) -> usize {
+
+        // get the current global write pointer and the available writable capacity. 
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let vacant_size = self.vacant_write_size(curr_write_idx);
+
+        // if available local-remaining wtite capacity is 0, update the `local_read_idx`
+        // and try again, or directly return it.
         if vacant_size == 0 {
             self.local_read_idx
                 .set(self.read_idx.load(Ordering::Acquire));
@@ -97,20 +180,48 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
+    /// Try send data from `batch_ptr` to `SyncRingBuf` with specified batch size of `batch_len`, 
+    /// return `0` when buffer is full or the size of successfully sended data `batch_size`.
+    /// 
+    /// #Examples
+    /// ```
+    /// use SyncRingBuf::lib::SyncRingBuf;
+    /// 
+    /// let srb_a = SyncRingBuf::with_capacity_at_least(2);
+    /// let srb_b = SyncRingBuf::with_capacity_at_least(10);
+    /// let batch = Vec!(1, 2, 3, 4, 5).as_ptr();
+    /// 
+    /// unsafe {
+    ///     assert_eq!(srb_a.send_batch(batch, 5), 2);
+    ///     assert_eq!(srb_b.send_batch(batch, 5), 5);
+    /// }
+    /// ```
     unsafe fn send_batch(&self, batch_ptr: *const T, batch_len: usize) -> usize {
+        
+        // get the current global write pointer and the available writable capacity. 
         let curr_write_idx = self.write_idx.load(Ordering::Relaxed);
         let mut vacant_size = self.vacant_write_size(curr_write_idx);
+
+        // if available local-remaining wtite capacity is smaller than specified batch size, 
+        // then update the `local_read_idx` and try again. 
         if vacant_size < batch_len {
             self.local_read_idx
                 .set(self.read_idx.load(Ordering::Acquire));
             vacant_size = self.vacant_write_size(curr_write_idx);
+            // If `vacant_size` is still 0 after update, we regard it as "global-full".
             if vacant_size == 0 {
                 return 0;
             }
         }
+
+        // get the smaller one between `vacant_size` and `batch_len`.
         let batch_size = std::cmp::min(vacant_size, batch_len);
 
+        // get the next writable pointer with "&" operator.
         let next_write_idx = (curr_write_idx + batch_size) & self.cap;
+
+        // if the begining index and ending index of sending data across the upper bound, namely their 
+        // memory is separated into two parts by it, calculate the size of them.
         let second_half = if curr_write_idx + batch_size < self.buf_len {
             0
         } else {
@@ -118,6 +229,7 @@ impl<T> SyncRingBuf<T> {
         };
         let first_half = batch_size - second_half;
 
+        // write two part of data to buffer according to calculated result of size. 
         std::ptr::copy(batch_ptr, self.buf.add(curr_write_idx), first_half);
         std::ptr::copy(batch_ptr.add(first_half), self.buf, second_half);
 
@@ -126,9 +238,28 @@ impl<T> SyncRingBuf<T> {
         batch_size
     }
 
+    /// Try read an element from buffer, return `None` when empty or `Option<T>`.
+    /// 
+    /// #Examples
+    /// ```
+    /// use SyncRingBuf::lib::SyncRingBuf;
+    /// 
+    /// let srb = SyncRingBuf::with_capacity_at_least(2);
+    /// srb.try_send(0);
+    /// srb.try_send(1);
+    /// 
+    /// assert_eq!(srb.try_recv(), Some(0));
+    /// assert_eq!(srb.try_recv(), Some(1));
+    /// assert_eq!(srb.try_recv(), None);
+    /// ```
     fn try_recv(&self) -> Option<T> {
+
+        // get the current global read pointer.
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
 
+        // if the next global read pointer meet with local write pointer,
+        // update the local write pointer and try again. if it's still empty
+        // after update, judge it as "global-empty" and return `None`.
         if curr_read_idx == self.local_write_idx.get() {
             self.local_write_idx
                 .set(self.write_idx.load(Ordering::Acquire));
@@ -137,6 +268,7 @@ impl<T> SyncRingBuf<T> {
             }
         }
 
+        // read from the `buf` field and return it.
         let t = unsafe { std::ptr::read(self.buf.add(curr_read_idx)) };
         self.read_idx
             .store((curr_read_idx + 1) & self.cap, Ordering::Release);
@@ -144,6 +276,8 @@ impl<T> SyncRingBuf<T> {
     }
 
     #[inline]
+    /// Return the local-length of readable capacity or larger global-length.
+    /// Implemented with the same way of `remaining_at_least()`, see it above.
     fn len_at_least(&self) -> usize {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
         let available_size = self.available_read_size(curr_read_idx);
@@ -156,6 +290,9 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
+    /// Try receive data from buffer with specified batch length, return the size 
+    /// of successfully received data.
+    /// Implemented with the same way of `send_batch()`, see it above.
     unsafe fn recv_batch(&self, batch_ptr: *mut T, batch_cap: usize) -> usize {
         let curr_read_idx = self.read_idx.load(Ordering::Relaxed);
         let mut available_size = self.available_read_size(curr_read_idx);
@@ -186,6 +323,8 @@ impl<T> SyncRingBuf<T> {
     }
 
     #[inline]
+    /// Calculate the local-remaining writable capacity according to local 
+    /// read pointer and given current write pointer.
     fn vacant_write_size(&self, curr_write_idx: usize) -> usize {
         let local_read_idx = self.local_read_idx.get();
 
@@ -196,6 +335,8 @@ impl<T> SyncRingBuf<T> {
         }
     }
 
+    /// Calculate the local-remaining readable capacity according to local 
+    /// write pointer and given current read pointer.
     #[inline]
     fn available_read_size(&self, curr_read_idx: usize) -> usize {
         let local_write_idx = self.local_write_idx.get();
@@ -207,11 +348,13 @@ impl<T> SyncRingBuf<T> {
     }
 
     #[inline]
+    /// Get the `cap` field of `SyncRIngBuf`.
     fn capacity(&self) -> usize {
         self.cap
     }
 }
 
+// Implement `Drop` trait for `SyncRingBuf`.
 impl<T> Drop for SyncRingBuf<T> {
     fn drop(&mut self) {
         while let Some(_) = self.try_recv() {}
@@ -222,27 +365,52 @@ impl<T> Drop for SyncRingBuf<T> {
     }
 }
 
+/// The producer of `SyncRingBuf`, encapsulate it with `Arc` pointer to make it 
+/// available for multithreading task.
+/// 
+/// #Examples
+/// 
+/// ```
+/// use SyncRingBuf::lib;
+/// let (mut s, mut r) = lib::with_capacity_at_least(2);//capacity is 3
+/// 
+/// assert_eq!(s.try_send(1), None);
+/// assert_eq!(s.remain_at_least, 2);
+/// assert_eq!(s.send_batch(&mut Vec!(2, 3)), 2);
+/// assert_eq!(s.remain_at_least, 0);
+/// assert_eq!(s.try_send(4), Some(4));
+/// assert_eq!(s.send_batch(&mut Vec!(2, 3)), 0);
+/// ```
 pub struct Sender<T> {
     inner: Arc<SyncRingBuf<T>>,
 }
 
+// Implement `Send` trait for producer.
 unsafe impl<T: Send> Send for Sender<T> {}
 
 impl<T> Sender<T> {
+    /// Try send a element to buffer, return `None` when success or
+    /// Some(T) when fail. 
     pub fn try_send(&mut self, t: T) -> Option<T> {
         self.inner.try_send(t)
     }
 
+    /// Calculate the writable capacity of buffer at least, for details see 
+    /// the `ramaining_at_least()` method of `SyncRingBuf`.
     pub fn remaining_at_least(&self) -> usize {
         self.inner.remaining_at_least()
     }
 
+    /// Try send data from given vector, return the size of successfully sended data.
     pub fn send_batch(&mut self, batch: &mut Vec<T>) -> usize {
         let n_pushed = unsafe { self.inner.send_batch(batch.as_ptr(), batch.len()) };
         if n_pushed == 0 {
             return 0;
         }
 
+        // if the size of successfully pushed data is smaller than vector's length (usually 
+        // because of the lack of buffer available write capacity), remove these pushed data 
+        // from given vector and reset the length. 
         unsafe {
             if n_pushed < batch.len() {
                 let src = batch.as_ptr().add(n_pushed);
@@ -255,35 +423,68 @@ impl<T> Sender<T> {
         n_pushed
     }
 
+    /// Try send data from given vector, return the size of successfully sended data.
+    /// This method is implemented with safe method, but is slower than `send_batch()`.
     pub fn send_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
+
+        // Take the smaller one between remaining write capacity and vector's length
+        // as the actual batch size.
         let batch_size = std::cmp::min(self.remaining_at_least(), batch.len());
         let drain = batch.drain(0..batch_size);
+
+        // Call `drain()` method to generate a iterator containing element number of 
+        // `batch_size` and push it one by one.
         for t in drain {
             assert!(self.try_send(t).is_none() == true, "this should not happen");
         }
         batch_size
     }
 
+    /// Get the `cap` field of consumer.
     pub fn capacity(&self) -> usize {
         self.inner.capacity()
     }
 }
 
+/// The consumer of `SyncRingBuf`, encapsulate it with `Arc` pointer to make it 
+/// available for multithreading task.
+/// 
+/// #Examples
+/// 
+/// ```
+/// use SyncRingBuf::lib;
+/// let (mut s, mut r) = lib::with_capacity_at_least(2);//capacity is 3
+/// let mut batch = Vec::with_capacity(3);
+/// 
+/// assert_eq!(s.send_batch(&mut Vec!(1, 2, 3)), 0);
+/// assert_eq!(r.try_recv(), Some(1));
+/// assert_eq!(r.recv_batch(&mut batch, 3);
+/// assert_eq!(r.try_recv(), None);
+/// assert_eq!(r.recv_batch(&mut batch, 0);
+/// ```
 pub struct Receiver<T> {
     inner: Arc<SyncRingBuf<T>>,
 }
 
+// Implement `Send` trait for producer.
 unsafe impl<T: Send> Send for Receiver<T> {}
 
 impl<T> Receiver<T> {
+    /// Try receive a element from buffer, return `Some(T)` when success or
+    /// None when fail. 
     pub fn try_recv(&mut self) -> Option<T> {
         self.inner.try_recv()
     }
 
+    /// Calculate the readable capacity of buffer at least, for details see 
+    /// the `len_at_least()` method of `SyncRingBuf`.
     pub fn len_at_least(&self) -> usize {
         self.inner.len_at_least()
     }
 
+    /// Try receive data from buffer, return the size of successfully received data.
+    /// it's counterpart of `send_batch()`, for details see the `send_batch()` method 
+    /// of `SyncRingBuf`.
     pub fn recv_batch(&mut self, batch: &mut Vec<T>) -> usize {
         let n_popped = unsafe {
             self.inner.recv_batch(
@@ -302,6 +503,8 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Try receive data from buffer, return the size of successfully received data.
+    /// This method is implemented with safe method, but is slower than `recv_batch()`.
     pub fn recv_batch_slow(&mut self, batch: &mut Vec<T>) -> usize {
         let batch_size = std::cmp::min(self.len_at_least(), batch.capacity() - batch.len());
         for _ in 0..batch_size {
@@ -312,6 +515,8 @@ impl<T> Receiver<T> {
     }
 }
 
+/// Creates a SyncRingBuf struct withcapacity at least of `cap_at_least`, return its
+/// producer `p`and consumer `c`.
 pub fn with_capacity_at_least<T>(cap_at_least: usize) -> (Sender<T>, Receiver<T>) {
     let rb = Arc::new(SyncRingBuf::with_capacity_at_least(cap_at_least));
     let p = Sender { inner: rb.clone() };
